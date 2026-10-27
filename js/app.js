@@ -16,14 +16,11 @@ document.addEventListener('DOMContentLoaded', () => {
   
   const displayAreaName = document.getElementById('display-area-name');
   const displayOwnerName = document.getElementById('display-owner-name');
-  const inputArea = document.getElementById('input_area');
-  const inputOwner = document.getElementById('input_owner');
-  const inputOwnerName = document.getElementById('input_owner_name');
-  const inputDocumento = document.getElementById('input_documento');
   const fieldDocumento = document.getElementById('field_documento');
   const selectAgent = document.getElementById('select_agent');
 
   let currentStep = 1;
+  let isSubmitting = false;
   const totalSteps = window.TOTAL_STEPS || stepPanels.length;
   const showStep1 = window.SHOW_STEP1 || false;
 
@@ -43,16 +40,13 @@ document.addEventListener('DOMContentLoaded', () => {
   // 1. Escuchar la selección de Asesor en la Lista Desplegable (Select)
   if (selectAgent) {
     selectAgent.addEventListener('change', () => {
+      // Solo cambia los textos visibles; el backend valida el asesor contra su catálogo.
       const selectedOption = selectAgent.options[selectAgent.selectedIndex];
-      const selectedAgent = selectAgent.value;
-      const associatedArea = selectedOption ? (selectedOption.getAttribute('data-area') || 'Alumni') : 'Alumni';
+      const agentName = selectedOption ? selectedOption.getAttribute('data-name') : '';
+      const associatedArea = selectedOption ? selectedOption.getAttribute('data-area') : '';
 
-      if (inputOwner) inputOwner.value = selectedAgent;
-      if (inputOwnerName) inputOwnerName.value = selectedAgent;
-      if (inputArea) inputArea.value = associatedArea;
-
-      if (displayOwnerName) displayOwnerName.textContent = selectedAgent || 'la persona que le atendió';
-      if (displayAreaName) displayAreaName.textContent = associatedArea;
+      if (displayOwnerName) displayOwnerName.textContent = agentName || 'la persona que te atendió';
+      if (displayAreaName && associatedArea) displayAreaName.textContent = associatedArea;
 
       hideError();
     });
@@ -91,15 +85,19 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   surveyForm.addEventListener('submit', (e) => {
-    if (!validateStep(currentStep)) {
+    // Enter en el campo de documento no debe enviar la encuesta antes del último paso.
+    if (currentStep !== totalSteps) {
+      e.preventDefault();
+      btnNext.click();
+      return false;
+    }
+
+    if (isSubmitting || !validateStep(currentStep)) {
       e.preventDefault();
       return false;
     }
 
-    if (fieldDocumento && inputDocumento) {
-      inputDocumento.value = fieldDocumento.value.trim();
-    }
-
+    isSubmitting = true;
     setSubmitLoadingState(true);
   });
 
@@ -151,15 +149,14 @@ document.addEventListener('DOMContentLoaded', () => {
     let msg = "";
 
     if (showStep1 && step === 1) {
-      if (fieldDocumento && fieldDocumento.value.trim() === '') {
+      // Misma regla que el backend: solo dígitos (se ignoran espacios, puntos y guiones), de 4 a 15.
+      const documento = fieldDocumento ? fieldDocumento.value.replace(/[\s.\-]/g, '') : '';
+      if (fieldDocumento && !/^[0-9]{4,15}$/.test(documento)) {
         isValid = false;
-        msg = "Por favor ingrese su número de documento de identificación.";
-      } else {
-        const hasOwner = inputOwner && inputOwner.value.trim() !== '';
-        if (selectAgent && selectAgent.value.trim() === '' && !hasOwner) {
-          isValid = false;
-          msg = "Por favor seleccione la persona que le atendió de la lista desplegable.";
-        }
+        msg = "Por favor ingrese su número de documento (solo números).";
+      } else if (selectAgent && selectAgent.value.trim() === '') {
+        isValid = false;
+        msg = "Por favor seleccione la persona que le atendió de la lista desplegable.";
       }
     } else {
       const evalStepIndex = showStep1 ? 2 : 1;

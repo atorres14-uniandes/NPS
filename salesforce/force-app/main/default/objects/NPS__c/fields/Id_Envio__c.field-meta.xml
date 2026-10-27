@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Id_Envio__c</fullName>
+    <caseSensitive>false</caseSensitive>
+    <description>Identificador único de cada envío del formulario web. Evita registros duplicados por reintentos o doble clic.</description>
+    <externalId>true</externalId>
+    <label>Id de envío</label>
+    <length>36</length>
+    <required>false</required>
+    <trackTrending>false</trackTrending>
+    <type>Text</type>
+    <unique>true</unique>
+</CustomField>

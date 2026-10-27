@@ -3,8 +3,18 @@
 /**
  * Vista de Agradecimiento tras completar la Encuesta (PHP < 8 Compatible)
  */
-$case_id = isset($_GET['case_id']) ? htmlspecialchars($_GET['case_id'], ENT_QUOTES, 'UTF-8') : '';
-$salesforce_error = isset($_GET['salesforce_error']) && $_GET['salesforce_error'] === '1';
+$messages = array(
+  'ok' => 'Tus respuestas han sido registradas exitosamente.',
+  'respondida' => 'Esta encuesta ya había sido respondida. Gracias por tu interés.',
+  'enlace' => 'El enlace de la encuesta no es válido.',
+  'expirada' => 'La encuesta expiró. Abre nuevamente el enlace o escanea el código QR.',
+  'limite' => 'Recibimos demasiados envíos desde tu conexión. Intenta de nuevo en unos minutos.',
+  'error' => 'No pudimos registrar tus respuestas en este momento. Intenta de nuevo más tarde.'
+);
+$estado = isset($_GET['estado']) && is_string($_GET['estado']) && isset($messages[$_GET['estado']])
+  ? $_GET['estado']
+  : 'ok';
+$is_error = in_array($estado, array('enlace', 'expirada', 'limite', 'error'), true);
 ?>
 <!DOCTYPE html>
 <html lang="es">
@@ -93,21 +103,9 @@ $salesforce_error = isset($_GET['salesforce_error']) && $_GET['salesforce_error'
       </div>
 
       <h1 class="thankyou-title">¡Muchas gracias por tu tiempo!</h1>
-      <?php if ($salesforce_error): ?>
-        <p class="thankyou-desc" style="color: #b42318;">
-          La encuesta fue recibida, pero no pudimos confirmar el envío a Salesforce Sandbox. Revisa el registro de PHP antes de repetir la prueba.
-        </p>
-      <?php else: ?>
-        <p class="thankyou-desc">
-          Tus respuestas han sido registradas exitosamente en nuestro sistema de <strong>Atención a Egresados</strong>.
-        </p>
-      <?php endif; ?>
-
-      <div>
-        <a href="index.php" class="btn btn-primary">
-          Volver al inicio
-        </a>
-      </div>
+      <p class="thankyou-desc"<?php echo $is_error ? ' style="color: #b42318;"' : ''; ?>>
+        <?php echo htmlspecialchars($messages[$estado], ENT_QUOTES, 'UTF-8'); ?>
+      </p>
     </div>
   </main>
 

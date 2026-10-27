@@ -1,7 +1,8 @@
 <?php
 /**
- * Procesador Backend de la Encuesta (Compatible con PHP < 8 y PHP 7.x)
- * Procesa la encuesta desde el servidor PHP sin exponer parámetros a JS ni al navegador.
+ * Procesador Backend de la Encuesta.
+ * Valida el envío, recupera el contexto desde la sesión del servidor y lo envía a Apex REST.
+ * El navegador nunca decide el caso ni el contacto; Salesforce los resuelve.
  */
 
 // Evitar acceso directo por GET
@@ -10,16 +11,38 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     exit;
 }
 
-// Cargar la configuración privada de Salesforce desde el servidor
+require __DIR__ . '/survey_common.php';
 $config = require __DIR__ . '/config.php';
+
+survey_start_session();
+
+function redirect_to($url)
+{
+    header('Location: ' . $url);
+    exit;
+}
+
+function post_value($key)
+{
+    return isset($_POST[$key]) && is_string($_POST[$key]) ? $_POST[$key] : '';
+}
 
 function getSalesforceAccessToken($oauthConfig, &$errorMessage)
 {
+    $grantType = isset($oauthConfig['grant_type']) ? $oauthConfig['grant_type'] : '';
     $requiredSettings = array(
         'token_url' => 'SF_TOKEN_URL',
         'client_id' => 'SF_CLIENT_ID',
         'client_secret' => 'SF_CLIENT_SECRET'
     );
+    if ($grantType === 'password') {
+        $requiredSettings['username'] = 'SF_USERNAME';
+        $requiredSettings['password'] = 'SF_PASSWORD';
+    } elseif ($grantType !== 'client_credentials') {
+        $errorMessage = 'SF_GRANT_TYPE debe ser "password" o "client_credentials".';
+        return false;
+    }
+
     foreach ($requiredSettings as $setting => $environmentName) {
         if (empty($oauthConfig[$setting])
             || strpos($oauthConfig[$setting], 'REPLACE_') === 0) {
@@ -34,23 +57,62 @@ function getSalesforceAccessToken($oauthConfig, &$errorMessage)
         return false;
     }
 
-    $ch = curl_init($oauthConfig['token_url']);
+    $tokenRequest = array(
+        'grant_type' => $grantType,
+        'client_id' => $oauthConfig['client_id'],
+        'client_secret' => $oauthConfig['client_secret']
+    );
+    if ($grantType === 'password') {
+        $tokenRequest['username'] = $oauthConfig['username'];
+        $tokenRequest['password'] = $oauthConfig['password'];
+    }
+
+    $result = salesforce_http_post(
+        $oauthConfig,
+        $oauthConfig['token_url'],
+        http_build_query($tokenRequest),
+        array('Accept: application/json', 'Content-Type: application/x-www-form-urlencoded'),
+        $errorMessage
+    );
+    if ($result === false) {
+        return false;
+    }
+
+    $tokenResponse = json_decode($result['body'], true);
+    if ($result['status'] < 200 || $result['status'] >= 300) {
+        // Solo el código de error de OAuth; la respuesta completa puede incluir datos de la cuenta.
+        $providerError = is_array($tokenResponse) && !empty($tokenResponse['error'])
+            ? $tokenResponse['error']
+            : 'sin_detalle';
+        $errorMessage = 'Salesforce rechazó la autenticación OAuth (HTTP '
+            . $result['status'] . '): ' . $providerError;
+        return false;
+    }
+
+    if (!is_array($tokenResponse) || empty($tokenResponse['access_token'])) {
+        $errorMessage = 'Salesforce respondió sin un access_token OAuth válido.';
+        return false;
+    }
+
+    return $tokenResponse['access_token'];
+}
+
+function salesforce_http_post($oauthConfig, $url, $body, $headers, &$errorMessage)
+{
+    $ch = curl_init($url);
     if ($ch === false) {
-        $errorMessage = 'No se pudo inicializar cURL para solicitar el token OAuth.';
+        $errorMessage = 'No se pudo inicializar cURL.';
         return false;
     }
 
     $curlOptions = array(
         CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => http_build_query(array(
-            'grant_type' => 'client_credentials',
-            'client_id' => $oauthConfig['client_id'],
-            'client_secret' => $oauthConfig['client_secret']
-        )),
+        CURLOPT_POSTFIELDS => $body,
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => array('Accept: application/json'),
+        CURLOPT_HTTPHEADER => $headers,
         CURLOPT_TIMEOUT => 20,
-        CURLOPT_SSL_VERIFYPEER => true
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2
     );
 
     if (!empty($oauthConfig['ca_bundle'])) {
@@ -65,206 +127,142 @@ function getSalesforceAccessToken($oauthConfig, &$errorMessage)
     $response = curl_exec($ch);
     $curlError = curl_error($ch);
     $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
 
     if ($response === false || $curlError !== '') {
-        $errorMessage = 'Error cURL al solicitar el token OAuth: ' . $curlError;
+        $errorMessage = 'Error cURL: ' . $curlError;
         return false;
     }
 
-    if ($httpCode < 200 || $httpCode >= 300) {
-        $tokenResponse = json_decode($response, true);
-        $providerMessage = is_array($tokenResponse) && !empty($tokenResponse['error_description'])
-            ? $tokenResponse['error_description']
-            : $response;
-        $errorMessage = 'Salesforce rechazó la autenticación OAuth (HTTP '
-            . $httpCode . '): ' . $providerMessage;
-        return false;
-    }
-
-    $tokenResponse = json_decode($response, true);
-    if (!is_array($tokenResponse) || empty($tokenResponse['access_token'])) {
-        $errorMessage = 'Salesforce respondió sin un access_token OAuth válido.';
-        return false;
-    }
-
-    return $tokenResponse['access_token'];
+    return array('status' => $httpCode, 'body' => $response);
 }
 
-// Sanitizar y obtener los datos enviados por el usuario
-$case_id = isset($_POST['case_id']) ? trim($_POST['case_id']) : '';
-$contact_id = isset($_POST['contact_id']) ? trim($_POST['contact_id']) : '';
-$owner = isset($_POST['owner']) ? trim($_POST['owner']) : '';
-$area = isset($_POST['area']) ? trim($_POST['area']) : 'Alumni';
-$evento = isset($_POST['evento']) ? trim($_POST['evento']) : '';
-$documento = isset($_POST['documento']) ? trim($_POST['documento']) : '';
-
-$solicitud_atendida = isset($_POST['q_atendido']) ? trim($_POST['q_atendido']) : '';
-$necesidad_resuelta = isset($_POST['q_resuelta']) ? trim($_POST['q_resuelta']) : '';
-$satisfaccion_atencion = isset($_POST['q_satisfaccion']) ? trim($_POST['q_satisfaccion']) : '';
-$calificacion_debora = isset($_POST['q_debora']) ? trim($_POST['q_debora']) : '';
-$comentarios_mejora = isset($_POST['q_mejoras']) ? trim($_POST['q_mejoras']) : '';
-$indicador_nps = isset($_POST['q_nps']) ? trim($_POST['q_nps']) : '';
-
-// Validar que las preguntas requeridas estén completas
-if (empty($solicitud_atendida) || empty($necesidad_resuelta) || empty($satisfaccion_atencion) || empty($calificacion_debora) || $indicador_nps === '') {
-    $redirectUrl = 'index.php?error=campos_incompletos';
-    if (!empty($case_id)) {
-        $redirectUrl .= '&case_id=' . urlencode($case_id);
-    }
-    if (!empty($contact_id)) {
-        $redirectUrl .= '&contactId=' . urlencode($contact_id);
-    }
-    if (!empty($owner)) {
-        $redirectUrl .= '&owner=' . urlencode($owner);
-    }
-    if (!empty($area)) {
-        $redirectUrl .= '&area=' . urlencode($area);
-    }
-    header('Location: ' . $redirectUrl);
-    exit;
+// 1. Validar que el formulario provenga de esta sesión (CSRF y contexto)
+$form_id = post_value('form_id');
+$form = survey_get_form($form_id);
+if ($form === null || !hash_equals($form['csrf'], post_value('csrf_token'))) {
+    redirect_to('gracias.php?estado=expirada');
+}
+if ($form['submitted']) {
+    redirect_to('gracias.php?estado=ok');
 }
 
-$mode = isset($config['mode']) ? $config['mode'] : 'HYBRID';
-$targetStatus = isset($config['target_status']) ? $config['target_status'] : 'Resuelto';
-$fieldsConfig = isset($config['fields']) ? $config['fields'] : array();
+$rateLimit = isset($config['rate_limit']) ? $config['rate_limit'] : array('max' => 20, 'window' => 600);
+if (!survey_rate_limit_ok($rateLimit['max'], $rateLimit['window'])) {
+    error_log('NPS: límite de envíos alcanzado.');
+    redirect_to('gracias.php?estado=limite');
+}
 
-// HYBRID y REST_API envían siempre a Apex, incluso cuando no hay Caso relacionado.
-if ($mode === 'HYBRID' || $mode === 'REST_API') {
-    $oauthConfig = isset($config['salesforce_oauth']) ? $config['salesforce_oauth'] : array();
-    $oauthError = '';
-    $accessToken = getSalesforceAccessToken($oauthConfig, $oauthError);
-    if ($accessToken === false) {
-        error_log('Error de autenticación Salesforce: ' . $oauthError);
-        header('Location: gracias.php' . (!empty($case_id) ? '?case_id=' . urlencode($case_id) . '&' : '?') . 'salesforce_error=1');
-        exit;
+$back_with_error = 'index.php?form=' . urlencode($form_id) . '&error=campos_incompletos';
+
+// 2. Validar respuestas contra los valores permitidos
+$answers = array();
+foreach (survey_answer_options() as $question => $allowedValues) {
+    $value = trim(post_value($question));
+    if (!in_array($value, $allowedValues, true)) {
+        redirect_to($back_with_error);
     }
+    $answers[$question] = $value;
+}
 
-    if (empty($oauthConfig['apex_url']) || strpos($oauthConfig['apex_url'], 'https://') !== 0) {
-        error_log('Error de configuración Salesforce: SF_APEX_URL debe ser una URL HTTPS.');
-        header('Location: gracias.php' . (!empty($case_id) ? '?case_id=' . urlencode($case_id) . '&' : '?') . 'salesforce_error=1');
-        exit;
+$comentarios = trim(str_replace("\0", '', post_value('q_mejoras')));
+$commentLength = function_exists('mb_strlen') ? mb_strlen($comentarios, 'UTF-8') : strlen($comentarios);
+if ($commentLength > SURVEY_COMMENT_MAX_LENGTH) {
+    redirect_to($back_with_error);
+}
+
+// 3. Asesor: el de la URL (guardado en sesión) o el elegido de la lista
+$agents_catalog = isset($config['agents']) ? $config['agents'] : array();
+$owner = $form['owner'];
+if ($owner === '') {
+    $owner = trim(post_value('owner'));
+    if (!isset($agents_catalog[$owner])) {
+        redirect_to($back_with_error);
     }
+}
 
-    $payloadData = array(
-        'caseId' => $case_id,
-        'contactId' => $contact_id,
-        'status' => $targetStatus,
-        'owner' => $owner,
-        'area' => $area,
-        'evento' => $evento,
-        'documento' => $documento,
-        'responses' => array(
-            'solicitudAtendida' => $solicitud_atendida,
-            'necesidadResuelta' => $necesidad_resuelta,
-            'satisfaccionAtencion' => $satisfaccion_atencion,
-            'calificacionDebora' => $calificacion_debora,
-            'comentariosMejora' => $comentarios_mejora,
-            'indicadorNPS' => $indicador_nps
-        )
-    );
-
-    $jsonData = json_encode($payloadData);
-    if ($jsonData === false) {
-        error_log('Error al codificar el payload de encuesta: ' . json_last_error_msg());
-        header('Location: gracias.php' . (!empty($case_id) ? '?case_id=' . urlencode($case_id) . '&' : '?') . 'salesforce_error=1');
-        exit;
+// 4. Documento: solo en encuestas sin caso
+$documento = '';
+if ($form['case_id'] === '') {
+    $documento = survey_normalize_document(post_value('documento'));
+    if (!preg_match(SURVEY_DOCUMENT_PATTERN, $documento)) {
+        redirect_to($back_with_error);
     }
+}
 
-    $ch = curl_init($oauthConfig['apex_url']);
-    if ($ch === false) {
-        error_log('Error de configuración Salesforce: no se pudo inicializar cURL para Apex REST.');
-        header('Location: gracias.php' . (!empty($case_id) ? '?case_id=' . urlencode($case_id) . '&' : '?') . 'salesforce_error=1');
-        exit;
-    }
+// 5. Enviar a Salesforce
+$oauthConfig = isset($config['salesforce_oauth']) ? $config['salesforce_oauth'] : array();
+$errorMessage = '';
+$accessToken = getSalesforceAccessToken($oauthConfig, $errorMessage);
+if ($accessToken === false) {
+    error_log('NPS: error de autenticación Salesforce. ' . $errorMessage);
+    redirect_to('gracias.php?estado=error');
+}
 
-    $headers = array(
+if (empty($oauthConfig['apex_url']) || strpos($oauthConfig['apex_url'], 'https://') !== 0) {
+    error_log('NPS: SF_APEX_URL debe ser una URL HTTPS.');
+    redirect_to('gracias.php?estado=error');
+}
+
+$payloadData = array(
+    // El mismo form_id se reenvía en cada reintento: Apex no duplica el registro.
+    'submissionId' => $form_id,
+    'caseId' => $form['case_id'],
+    'documento' => $documento,
+    'owner' => $owner,
+    'recordType' => isset($form['record_type']) ? $form['record_type'] : '',
+    'responses' => array(
+        'solicitudAtendida' => $answers['q_atendido'],
+        'necesidadResuelta' => $answers['q_resuelta'],
+        'satisfaccionAtencion' => $answers['q_satisfaccion'],
+        'calificacionDebora' => $answers['q_debora'],
+        'comentariosMejora' => $comentarios,
+        'indicadorNPS' => $answers['q_nps']
+    )
+);
+
+$jsonData = json_encode($payloadData);
+if ($jsonData === false) {
+    error_log('NPS: error al codificar el payload: ' . json_last_error_msg());
+    redirect_to('gracias.php?estado=error');
+}
+
+$result = salesforce_http_post(
+    $oauthConfig,
+    $oauthConfig['apex_url'],
+    $jsonData,
+    array(
         'Content-Type: application/json',
         'Accept: application/json',
         'Authorization: Bearer ' . $accessToken
-    );
-
-    $curlOptions = array(
-        CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => $jsonData,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => $headers,
-        CURLOPT_TIMEOUT => 20,
-        CURLOPT_SSL_VERIFYPEER => true
-    );
-    if (!empty($oauthConfig['ca_bundle'])) {
-        if (!is_file($oauthConfig['ca_bundle']) || !is_readable($oauthConfig['ca_bundle'])) {
-            error_log('Error de configuración Salesforce: el paquete indicado en SF_CA_BUNDLE no existe o no se puede leer.');
-            header('Location: gracias.php' . (!empty($case_id) ? '?case_id=' . urlencode($case_id) . '&' : '?') . 'salesforce_error=1');
-            exit;
-        }
-        $curlOptions[CURLOPT_CAINFO] = $oauthConfig['ca_bundle'];
-    }
-    curl_setopt_array($ch, $curlOptions);
-
-    $response = curl_exec($ch);
-    $curl_error = curl_error($ch);
-    $http_code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $salesforce_error = $response === false || !empty($curl_error) || $http_code < 200 || $http_code >= 300;
-
-    $response_data = null;
-    if (!$salesforce_error) {
-        $response_data = json_decode($response, true);
-        $salesforce_error = !is_array($response_data)
-            || !isset($response_data['success'])
-            || $response_data['success'] !== true;
-    }
-
-    if ($salesforce_error) {
-        error_log('Error al enviar encuesta a Salesforce. HTTP ' . $http_code . ': ' . $curl_error . ' Respuesta: ' . $response);
-    }
-
-    $redirect = 'gracias.php';
-    if (!empty($case_id)) {
-        $redirect .= '?case_id=' . urlencode($case_id);
-    }
-    if ($salesforce_error) {
-        $redirect .= (strpos($redirect, '?') === false ? '?' : '&') . 'salesforce_error=1';
-    } elseif (!empty($response_data['npsId'])) {
-        $redirect .= (strpos($redirect, '?') === false ? '?' : '&') . 'nps_id=' . urlencode($response_data['npsId']);
-    }
-    header('Location: ' . $redirect);
-    exit;
-
-} 
-// CASO 2: Si NO existe ID de Caso -> Crear Nuevo Caso / Registrar Encuesta Presencial
-else {
-    
-    $postData = array(
-        'orgid' => $config['org_id'],
-        'status' => $targetStatus,
-        isset($fieldsConfig['solicitud_atendida']) ? $fieldsConfig['solicitud_atendida'] : 'Solicitud_Atendida__c' => $solicitud_atendida,
-        isset($fieldsConfig['necesidad_resuelta']) ? $fieldsConfig['necesidad_resuelta'] : 'Necesidad_Resuelta__c' => $necesidad_resuelta,
-        isset($fieldsConfig['satisfaccion_atencion']) ? $fieldsConfig['satisfaccion_atencion'] : 'Satisfaccion_Atencion__c' => $satisfaccion_atencion,
-        isset($fieldsConfig['calificacion_debora']) ? $fieldsConfig['calificacion_debora'] : 'Calificacion_Debora__c' => $calificacion_debora,
-        isset($fieldsConfig['comentarios_mejora']) ? $fieldsConfig['comentarios_mejora'] : 'description' => $comentarios_mejora,
-        isset($fieldsConfig['indicador_nps']) ? $fieldsConfig['indicador_nps'] : 'Indicador_NPS__c' => $indicador_nps,
-        isset($fieldsConfig['area']) ? $fieldsConfig['area'] : 'Area__c' => $area,
-        isset($fieldsConfig['asesor']) ? $fieldsConfig['asesor'] : 'Asesor__c' => $owner,
-        isset($fieldsConfig['evento']) ? $fieldsConfig['evento'] : 'Evento__c' => $evento,
-        isset($fieldsConfig['documento']) ? $fieldsConfig['documento'] : 'Documento__c' => $documento
-    );
-
-    $ch = curl_init($config['web_to_case_url']);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($postData));
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 15);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
-
-    $response = curl_exec($ch);
-    $curl_error = curl_error($ch);
-    $http_code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    if (!empty($curl_error) || $http_code < 200 || $http_code >= 400) {
-        error_log('Error al crear caso en Salesforce Web-to-Case. HTTP ' . $http_code . ': ' . $curl_error . ' Respuesta: ' . $response);
-        header('Location: gracias.php?salesforce_error=1');
-        exit;
-    }
-
-    header('Location: gracias.php');
-    exit;
+    ),
+    $errorMessage
+);
+if ($result === false) {
+    error_log('NPS: error al llamar a Apex REST. ' . $errorMessage);
+    redirect_to('gracias.php?estado=error');
 }
+
+$response = json_decode($result['body'], true);
+$code = is_array($response) && isset($response['code']) && is_string($response['code']) ? $response['code'] : '';
+$success = is_array($response) && isset($response['success']) && $response['success'] === true;
+
+if ($success && $result['status'] >= 200 && $result['status'] < 300) {
+    survey_mark_submitted($form_id);
+    redirect_to('gracias.php?estado=ok');
+}
+
+// Solo se registra el código HTTP y el código funcional; nunca el documento ni las respuestas.
+error_log('NPS: Salesforce no registró la encuesta. HTTP ' . $result['status'] . ' código ' . ($code !== '' ? $code : 'sin_codigo'));
+
+if ($code === 'ALREADY_ANSWERED') {
+    survey_mark_submitted($form_id);
+    redirect_to('gracias.php?estado=respondida');
+}
+if ($code === 'INVALID_CASE') {
+    redirect_to('gracias.php?estado=enlace');
+}
+if ($code === 'INVALID_REQUEST') {
+    redirect_to($back_with_error);
+}
+redirect_to('gracias.php?estado=error');

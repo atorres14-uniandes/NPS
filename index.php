@@ -1,95 +1,75 @@
 <?php
 
 /**
- * Vista Principal de Encuesta (PHP < 8 Compatible)
- * Selección de Asesor mediante Lista Desplegable (Select).
+ * Vista Principal de Encuesta.
+ *
+ * Parámetros de URL admitidos:
+ *   case_id  Id de 18 caracteres del Caso (encuestas enviadas por correo). Sin él se pide el documento.
+ *   owner    Id del usuario de Salesforce que prestó el servicio. Sin él se muestra la lista de asesores.
+ *   area     Área del servicio (debe existir en config.php).
+ *   evento   Nombre del evento (solo informativo por ahora).
+ *   tipo     Nombre técnico del tipo de registro de NPS__c (p.ej. Evento, Experiencia). Lo valida Apex.
+ *
+ * Estos valores se guardan en la sesión del servidor; el formulario solo envía un identificador opaco.
  */
 
+require __DIR__ . '/survey_common.php';
 $config = require __DIR__ . '/config.php';
 $agents_catalog = isset($config['agents']) ? $config['agents'] : array();
+$areas = isset($config['areas']) ? $config['areas'] : array();
 
-// 1. Extraer Parámetros URL
-$case_id = '';
-if (isset($_GET['case_id'])) {
-  $case_id = trim($_GET['case_id']);
-} elseif (isset($_GET['casenumber'])) {
-  $case_id = trim($_GET['casenumber']);
-} elseif (isset($_GET['id'])) {
-  $case_id = trim($_GET['id']);
-} elseif (isset($_GET['c'])) {
-  $case_id = trim($_GET['c']);
-}
+survey_start_session();
 
-$contact_id = '';
-if (isset($_GET['contactId'])) {
-  $contact_id = trim($_GET['contactId']);
-} elseif (isset($_GET['contact_id'])) {
-  $contact_id = trim($_GET['contact_id']);
-}
+$invalid_link = false;
+$form_id = isset($_GET['form']) ? (string) $_GET['form'] : '';
+$context = survey_get_form($form_id);
 
-$raw_owner = '';
-if (isset($_GET['owner'])) {
-  $raw_owner = trim($_GET['owner']);
-} elseif (isset($_GET['propietario'])) {
-  $raw_owner = trim($_GET['propietario']);
-} elseif (isset($_GET['owner_id'])) {
-  $raw_owner = trim($_GET['owner_id']);
-} elseif (isset($_GET['asesor'])) {
-  $raw_owner = trim($_GET['asesor']);
-}
+// Si vuelve por un error de validación se reutiliza el mismo formulario y su contexto.
+if ($context === null || $context['submitted']) {
+  $case_id = isset($_GET['case_id']) ? trim((string) $_GET['case_id']) : '';
+  if ($case_id !== '' && !survey_is_salesforce_id($case_id, '500', true)) {
+    $invalid_link = true;
+  }
 
-$owner_display_name = '';
-$area = 'Alumni';
+  $owner = isset($_GET['owner']) ? trim((string) $_GET['owner']) : '';
+  if (!survey_is_salesforce_id($owner, '005')) {
+    $owner = '';
+  }
 
-// Resolver Owner (soporta Long ID de Salesforce o Nombre)
-if (!empty($raw_owner)) {
-  if (isset($agents_catalog[$raw_owner])) {
-    $owner_display_name = $agents_catalog[$raw_owner]['name'];
-    $area = $agents_catalog[$raw_owner]['area'];
-  } else {
-    $owner_display_name = $raw_owner;
-    if (isset($_GET['area'])) {
-      $area_param = ucfirst(strtolower(trim($_GET['area'])));
-      if (in_array($area_param, array('Alumni', 'Filantropia', 'Filantropía', 'Servicios'))) {
-        $area = ($area_param === 'Filantropia') ? 'Filantropía' : $area_param;
-      }
-    }
+  $area = isset($_GET['area']) ? survey_resolve_area($_GET['area'], $areas) : '';
+  if ($area === '' && $owner !== '' && isset($agents_catalog[$owner])) {
+    $area = $agents_catalog[$owner]['area'];
+  }
+
+  $context = array(
+    'case_id' => $case_id,
+    'owner' => $owner,
+    'area' => $area !== '' ? $area : 'Alumni',
+    'evento' => isset($_GET['evento']) ? survey_clean_text($_GET['evento'], 100) : '',
+    'record_type' => (isset($_GET['tipo']) && is_string($_GET['tipo']) && preg_match('/^[A-Za-z][A-Za-z0-9_]{0,79}$/', $_GET['tipo']))
+      ? $_GET['tipo']
+      : ''
+  );
+
+  $form_id = $invalid_link ? '' : survey_register_form($context);
+  if (!$invalid_link) {
+    $context = survey_get_form($form_id);
   }
 }
 
-$evento = '';
-if (isset($_GET['evento'])) {
-  $evento = trim($_GET['evento']);
-} elseif (isset($_GET['event'])) {
-  $evento = trim($_GET['event']);
-}
+$area = $context['area'];
+$evento = $context['evento'];
+$owner_display_name = ($context['owner'] !== '' && isset($agents_catalog[$context['owner']]))
+  ? $agents_catalog[$context['owner']]['name']
+  : '';
 
-$documento = '';
-if (isset($_GET['documento'])) {
-  $documento = trim($_GET['documento']);
-} elseif (isset($_GET['cedula'])) {
-  $documento = trim($_GET['cedula']);
-} elseif (isset($_GET['contacto'])) {
-  $documento = trim($_GET['contacto']);
-} elseif (isset($_GET['doc'])) {
-  $documento = trim($_GET['doc']);
-}
-
-// 2. Evaluar qué información requiere el primer paso
-$need_identification = (empty($documento) && empty($case_id));
-$need_agent_selection = empty($raw_owner);
+// Con caso no se pide documento: el contacto lo toma Salesforce del caso.
+$need_identification = $context['case_id'] === '';
+$need_agent_selection = $context['owner'] === '';
 $show_step1 = ($need_identification || $need_agent_selection);
 
 $total_steps = $show_step1 ? 3 : 2;
 $has_error = isset($_GET['error']) && $_GET['error'] === 'campos_incompletos';
-
-// Lista de asesores únicos para la lista desplegable
-$unique_agents = array();
-foreach ($agents_catalog as $key => $info) {
-  if ($key === $info['name'] && !isset($unique_agents[$info['name']])) {
-    $unique_agents[$info['name']] = $info;
-  }
-}
 ?>
 <!DOCTYPE html>
 <html lang="es">
@@ -99,7 +79,7 @@ foreach ($agents_catalog as $key => $info) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Encuesta de Satisfacción</title>
   <meta name="description" content="Breve encuesta de satisfacción de servicio para egresados.">
-  <link rel="stylesheet" href="css/styles.css?v=1.2">
+  <link rel="stylesheet" href="css/styles.css?v=1.3">
 </head>
 
 <body>
@@ -118,18 +98,18 @@ foreach ($agents_catalog as $key => $info) {
       <h1>Tu opinión nos importa</h1>
       <p>Solo te tomará un minuto responder estas preguntas.</p>
 
-      <?php if (!empty($case_id)): ?>
-        <div class="case-info-bar" id="case-badge">
-          <span>Referencia Caso:</span> <strong>#<?php echo htmlspecialchars($case_id, ENT_QUOTES, 'UTF-8'); ?></strong>
-        </div>
-      <?php endif; ?>
-
       <?php if (!empty($evento)): ?>
         <div class="case-info-bar" style="background: #eef2ff; color: #4f46e5; margin-left: 0.25rem;">
           <span>Evento:</span> <strong><?php echo htmlspecialchars($evento, ENT_QUOTES, 'UTF-8'); ?></strong>
         </div>
       <?php endif; ?>
     </header>
+
+    <?php if ($invalid_link): ?>
+      <div class="error-banner active">
+        <span>El enlace de la encuesta no es válido. Verifica que lo hayas copiado completo.</span>
+      </div>
+    <?php else: ?>
 
     <!-- Barra de Progreso -->
     <div class="progress-container">
@@ -147,14 +127,9 @@ foreach ($agents_catalog as $key => $info) {
     <!-- Formulario Principal -->
     <form id="survey-form" method="POST" action="process_survey.php" class="survey-form">
 
-      <!-- Campos ocultos transferidos por URL -->
-      <input type="hidden" id="case_id" name="case_id" value="<?php echo htmlspecialchars($case_id, ENT_QUOTES, 'UTF-8'); ?>">
-      <input type="hidden" id="contact_id" name="contact_id" value="<?php echo htmlspecialchars($contact_id, ENT_QUOTES, 'UTF-8'); ?>">
-      <input type="hidden" id="evento" name="evento" value="<?php echo htmlspecialchars($evento, ENT_QUOTES, 'UTF-8'); ?>">
-      <input type="hidden" id="input_owner" name="owner" value="<?php echo htmlspecialchars($raw_owner, ENT_QUOTES, 'UTF-8'); ?>">
-      <input type="hidden" id="input_owner_name" name="owner_name" value="<?php echo htmlspecialchars($owner_display_name, ENT_QUOTES, 'UTF-8'); ?>">
-      <input type="hidden" id="input_area" name="area" value="<?php echo htmlspecialchars($area, ENT_QUOTES, 'UTF-8'); ?>">
-      <input type="hidden" id="input_documento" name="documento" value="<?php echo htmlspecialchars($documento, ENT_QUOTES, 'UTF-8'); ?>">
+      <!-- El contexto (caso, asesor, área) queda en la sesión del servidor -->
+      <input type="hidden" name="form_id" value="<?php echo htmlspecialchars($form_id, ENT_QUOTES, 'UTF-8'); ?>">
+      <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($context['csrf'], ENT_QUOTES, 'UTF-8'); ?>">
 
       <!-- Banner de Errores de Validación -->
       <div class="error-banner <?php echo $has_error ? 'active' : ''; ?>" id="error-banner">
@@ -178,17 +153,19 @@ foreach ($agents_catalog as $key => $info) {
             <!-- Campo Identificación Persona -->
             <div class="question-group">
               <label class="question-label" for="field_documento">
-                Documento de Identificación o Cédula
+                Número de documento de identificación
                 <span style="color: #ef4444;">*</span>
               </label>
               <input
                 type="text"
                 id="field_documento"
-                name="q_documento"
+                name="documento"
                 class="custom-textarea"
                 style="min-height: 48px; height: 48px; resize: none;"
-                placeholder="Ingresa tu número de documento o correo..."
-                value="<?php echo htmlspecialchars($documento, ENT_QUOTES, 'UTF-8'); ?>">
+                inputmode="numeric"
+                autocomplete="off"
+                maxlength="20"
+                placeholder="Ingresa tu número de documento">
             </div>
           <?php endif; ?>
 
@@ -200,15 +177,16 @@ foreach ($agents_catalog as $key => $info) {
               </label>
               <select
                 id="select_agent"
-                name="select_agent"
+                name="owner"
                 class="custom-textarea"
                 style="min-height: 50px; height: 50px; padding: 0.75rem 1rem; cursor: pointer; font-size: 0.95rem; font-weight: 600;">
                 <option value="">-- Selecciona la persona que te atendió --</option>
-                <?php foreach ($unique_agents as $agent_name => $info): ?>
+                <?php foreach ($agents_catalog as $agent_id => $info): ?>
                   <option
-                    value="<?php echo htmlspecialchars($agent_name, ENT_QUOTES, 'UTF-8'); ?>"
+                    value="<?php echo htmlspecialchars($agent_id, ENT_QUOTES, 'UTF-8'); ?>"
+                    data-name="<?php echo htmlspecialchars($info['name'], ENT_QUOTES, 'UTF-8'); ?>"
                     data-area="<?php echo htmlspecialchars($info['area'], ENT_QUOTES, 'UTF-8'); ?>">
-                    <?php echo htmlspecialchars($agent_name, ENT_QUOTES, 'UTF-8'); ?> (<?php echo htmlspecialchars($info['area'], ENT_QUOTES, 'UTF-8'); ?>)
+                    <?php echo htmlspecialchars($info['name'], ENT_QUOTES, 'UTF-8'); ?> (<?php echo htmlspecialchars($info['area'], ENT_QUOTES, 'UTF-8'); ?>)
                   </option>
                 <?php endforeach; ?>
               </select>
@@ -306,7 +284,7 @@ foreach ($agents_catalog as $key => $info) {
         <!-- Pregunta 4: Adaptada al Nombre de la Persona que Atendió -->
         <div class="question-group">
           <label class="question-label">
-            <span class="question-number">4.</span> Califica la atención recibida de <strong id="display-owner-name"><?php echo !empty($owner_display_name) ? htmlspecialchars($owner_display_name, ENT_QUOTES, 'UTF-8') : 'la persona que le atendió'; ?></strong> en una escala de 1 a 5
+            <span class="question-number">4.</span> Califica la atención recibida de <strong id="display-owner-name"><?php echo !empty($owner_display_name) ? htmlspecialchars($owner_display_name, ENT_QUOTES, 'UTF-8') : 'la persona que te atendió'; ?></strong> en una escala de 1 a 5
           </label>
           <div class="rating-scale-5">
             <label class="rating-card-5">
@@ -380,6 +358,7 @@ foreach ($agents_catalog as $key => $info) {
             name="q_mejoras"
             class="custom-textarea"
             placeholder="Escribe tus sugerencias o comentarios..."
+            maxlength="<?php echo SURVEY_COMMENT_MAX_LENGTH; ?>"
             rows="4"></textarea>
         </div>
       </div>
@@ -409,6 +388,7 @@ foreach ($agents_catalog as $key => $info) {
       </div>
 
     </form>
+    <?php endif; ?>
 
     <footer class="survey-footer">
       <p></p>
@@ -416,12 +396,14 @@ foreach ($agents_catalog as $key => $info) {
 
   </main>
 
-  <script>
-    window.SHOW_STEP1 = <?php echo $show_step1 ? 'true' : 'false'; ?>;
-    window.TOTAL_STEPS = <?php echo $total_steps; ?>;
-  </script>
+  <?php if (!$invalid_link): ?>
+    <script>
+      window.SHOW_STEP1 = <?php echo $show_step1 ? 'true' : 'false'; ?>;
+      window.TOTAL_STEPS = <?php echo $total_steps; ?>;
+    </script>
 
-  <script src="js/app.js"></script>
+    <script src="js/app.js?v=1.3"></script>
+  <?php endif; ?>
 </body>
 
 </html>
